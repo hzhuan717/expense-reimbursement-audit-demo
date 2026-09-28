@@ -28,7 +28,47 @@ function evaluateExpense(data, priorRecords = []) {
     { name: '模拟真伪', passed: !suspect, detail: suspect ? '模拟查验结果：疑似伪票' : '模拟查验结果：真票' }
   ];
 }
-if (typeof module !== 'undefined') module.exports = { LIMITS, normalizeInvoice, validateExpense, evaluateExpense };
+function parseInvoiceText(text) {
+  const source = String(text || '');
+  const lines = source.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const normalizedLines = lines.map(line => line.normalize('NFKC').replace(/[\s,，]/g, ''));
+  const compact = source.normalize('NFKC').replace(/[\s,，]/g, '');
+  const invoiceMatch = compact.match(/(?:发票号码|电子发票号码|票据号码|Invoice(?:No\.?|Number)|发票号)[:：]?([A-Z0-9-]{8,30})/i);
+  const dateMatch = compact.match(/开票日期[:：]?(\d{4})[年./-]?(\d{1,2})[月./-]?(\d{1,2})日?/);
+  let amount = '';
+  const totalIndex = normalizedLines.findIndex(line => /价税合计|小写合计|含税合计|合计金额/.test(line));
+  if (totalIndex >= 0) {
+    const totalContext = `${normalizedLines[totalIndex]}${normalizedLines[totalIndex + 1] || ''}`;
+    const totalLabelEnd = totalContext.search(/[0-9]/);
+    const totalMatch = totalLabelEnd >= 0 ? totalContext.slice(totalLabelEnd).match(/^([0-9][0-9,]*(?:\.\d{1,2})?)/) : null;
+    if (totalMatch) amount = totalMatch[1].replace(/,/g, '');
+  }
+  if (!amount) {
+    const amountLine = normalizedLines.find(line => /^金额[:：]?/.test(line));
+    const amountMatch = amountLine?.match(/^金额[:：]?[^0-9]{0,12}([0-9][0-9,]*(?:\.\d{1,2})?)/);
+    if (amountMatch) amount = amountMatch[1].replace(/,/g, '');
+  }
+  if (!amount) {
+    const amountMatch = compact.match(/(?:价税合计(?:\(小写\))?|小写合计|含税合计|合计金额|合计)(?:人民币)?[¥￥]?([0-9][0-9]*(?:\.[0-9]{1,2})?)/);
+    if (amountMatch) amount = amountMatch[1];
+  }
+  const sellerLine = normalizedLines.find(line => /销售方名称|销售方/.test(line));
+  const sellerMatch = sellerLine?.match(/(?:销售方名称|销售方)[:：]?(.+)/);
+  const compactSource = source.normalize('NFKC').replace(/\s/g, '');
+  let category = '';
+  if (/(出租车|滴滴|交通运输|运输服务|客运|交通服务|铁路|航空)/.test(compactSource)) category = '交通费';
+  else if (/(住宿|酒店|宾馆)/.test(compactSource)) category = '住宿费';
+  else if (/(餐饮|餐费|食品餐)/.test(compactSource)) category = '餐饮费';
+  else if (/(办公用品|文具|打印耗材)/.test(compactSource)) category = '办公用品';
+  return {
+    invoice: invoiceMatch ? invoiceMatch[1].toUpperCase() : '',
+    amount,
+    invoiceDate: dateMatch ? `${dateMatch[1]}-${dateMatch[2].padStart(2, '0')}-${dateMatch[3].padStart(2, '0')}` : '',
+    seller: sellerMatch ? sellerMatch[1].replace(/[|丨]/g, '').trim() : '',
+    category
+  };
+}
+if (typeof module !== 'undefined') module.exports = { LIMITS, normalizeInvoice, validateExpense, evaluateExpense, parseInvoiceText };
 
 if (typeof document !== 'undefined') {
   const $ = selector => document.querySelector(selector);
@@ -36,6 +76,9 @@ if (typeof document !== 'undefined') {
   const latest = $('#latest-result');
   let records = loadRecords();
   let checking = false;
+  let ocrWorker = null;
+  let ocrLibraryPromise = null;
+  let previewUrl = null;
   const scenarios = {
     pass: { applicant: '张同学', department: '市场部', category: '交通费', amount: '120.00', invoice: 'FP-PASS-001', reason: '参加虚构客户交流的市内交通费用' },
     duplicate: { applicant: '李同学', department: '研发部', category: '办公用品', amount: '88.00', invoice: 'FP-HIST-001', reason: '购买项目演示所需办公用品' },
@@ -107,6 +150,80 @@ if (typeof document !== 'undefined') {
     for (const step of steps) flow.append(node('span', '', step)); latest.append(flow);
   }
   function refresh() { renderMetrics(); renderLists(); }
+  function setOCRProgress(message, ratio = null) {
+    $('#ocr-progress').hidden = false;
+    $('#ocr-status').textContent = message;
+    if (ratio !== null) $('#progress-fill').style.width = `${Math.round(Math.max(0, Math.min(1, ratio)) * 100)}%`;
+  }
+  function loadOCRLibrary() {
+    if (window.Tesseract) return Promise.resolve();
+    if (ocrLibraryPromise) return ocrLibraryPromise;
+    const sources = [
+      'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/tesseract.min.js',
+      'https://unpkg.com/tesseract.js@7.0.0/dist/tesseract.min.js'
+    ];
+    ocrLibraryPromise = new Promise((resolve, reject) => {
+      const trySource = index => {
+        if (index >= sources.length) { ocrLibraryPromise = null; reject(new Error('OCR 引擎下载失败，请检查网络后重试。')); return; }
+        const script = document.createElement('script'); script.src = sources[index]; script.async = true;
+        script.onload = () => window.Tesseract ? resolve() : trySource(index + 1);
+        script.onerror = () => { script.remove(); trySource(index + 1); };
+        document.head.append(script);
+      };
+      trySource(0);
+    });
+    return ocrLibraryPromise;
+  }
+  async function getOCRWorker() {
+    if (ocrWorker) return ocrWorker;
+    await loadOCRLibrary();
+    ocrWorker = await window.Tesseract.createWorker('chi_sim', 1, {
+      langPath: 'https://unpkg.com/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int',
+      logger: event => {
+        const labels = { loading_tesseract_core: '正在加载 OCR 引擎…', loading_language_traineddata: '正在下载简体中文模型（首次使用）…', initializing_api: '正在初始化识别器…', recognizing_text: '正在识别发票内容…' };
+        setOCRProgress(labels[event.status] || '正在准备识别…', event.progress);
+      }
+    });
+    return ocrWorker;
+  }
+  function showOCRResults(text, parsed) {
+    const resultFields = [
+      ['发票号码', parsed.invoice], ['价税合计', parsed.amount ? `¥${parsed.amount}` : '未识别'],
+      ['开票日期', parsed.invoiceDate || '未识别'], ['销售方', parsed.seller || '未识别'],
+      ['费用类型建议', parsed.category || '未识别']
+    ];
+    const fields = $('#ocr-fields'); fields.replaceChildren();
+    for (const [label, value] of resultFields) {
+      const item = node('div', 'ocr-field'); item.append(node('span', '', label), node('strong', '', value || '未识别')); fields.append(item);
+    }
+    $('#ocr-raw').textContent = text || '未检测到文字。';
+    $('#ocr-output').hidden = false;
+    if (parsed.invoice) form.elements.invoice.value = parsed.invoice;
+    if (parsed.amount) form.elements.amount.value = parsed.amount;
+    if (parsed.invoiceDate) form.elements.invoiceDate.value = parsed.invoiceDate;
+    if (parsed.seller) form.elements.seller.value = parsed.seller;
+    if (parsed.category) form.elements.category.value = parsed.category;
+    clearError();
+  }
+  async function recognizeInvoice(file) {
+    if (!file || !/^image\/(png|jpeg|webp)$/.test(file.type)) { setOCRProgress('请选择 PNG、JPG 或 WebP 格式的图片。', 0); return; }
+    if (file.size > 8 * 1024 * 1024) { setOCRProgress('图片不能超过 8 MB，请压缩或裁剪后再试。', 0); return; }
+    const preview = $('#invoice-preview'); if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = URL.createObjectURL(file); preview.src = previewUrl; $('#ocr-output').hidden = false;
+    $('#choose-invoice').disabled = true; $('#sample-invoice').disabled = true; setOCRProgress('正在启动中文 OCR…', 0.02);
+    try {
+      const worker = await getOCRWorker();
+      const { data } = await worker.recognize(file);
+      const parsed = parseInvoiceText(data.text);
+      showOCRResults(data.text, parsed);
+      const foundCount = [parsed.invoice, parsed.amount, parsed.invoiceDate, parsed.seller].filter(Boolean).length;
+      setOCRProgress(foundCount ? `识别完成，提取到 ${foundCount} 项信息。请核对后提交。` : '识别完成，但未提取到关键字段。请换用更清晰的图片或手动填写。', 1);
+    } catch (error) {
+      setOCRProgress(error?.message || '识别失败，请检查网络或更换图片重试。', 0);
+    } finally {
+      $('#choose-invoice').disabled = false; $('#sample-invoice').disabled = false;
+    }
+  }
   function review(id, decision, note) {
     const trimmed = note.trim(); if (!trimmed) { alert('请先填写复核说明，再作出人工判断。'); return; }
     const row = records.find(item => item.id === id); if (!row || row.status !== 'pending') return;
@@ -128,6 +245,14 @@ if (typeof document !== 'undefined') {
     }, 650);
   });
   document.querySelectorAll('.nav-item').forEach(button => button.addEventListener('click', () => switchView(button.dataset.view)));
+  $('#choose-invoice').addEventListener('click', () => $('#invoice-image').click());
+  $('#invoice-image').addEventListener('change', event => recognizeInvoice(event.target.files?.[0]));
+  $('#sample-invoice').addEventListener('click', async () => {
+    $('#sample-invoice').disabled = true; setOCRProgress('正在载入示例发票…', 0.02);
+    try { const response = await fetch('./sample-invoice.png'); if (!response.ok) throw new Error('示例图片暂时无法载入。'); const blob = await response.blob(); await recognizeInvoice(new File([blob], 'sample-invoice.png', { type: 'image/png' })); }
+    catch (error) { setOCRProgress(error?.message || '示例发票载入失败。', 0); $('#sample-invoice').disabled = false; }
+  });
+  window.addEventListener('pagehide', () => { if (previewUrl) URL.revokeObjectURL(previewUrl); if (ocrWorker) ocrWorker.terminate(); });
   document.querySelectorAll('[data-scenario]').forEach(button => button.addEventListener('click', () => { const data = scenarios[button.dataset.scenario]; for (const [key, value] of Object.entries(data)) form.elements[key].value = value; clearError(); form.scrollIntoView({ behavior: 'smooth', block: 'start' }); }));
   const dialog = $('#confirm-dialog'); $('#reset-btn').addEventListener('click', () => dialog.showModal()); dialog.addEventListener('close', () => { if (dialog.returnValue !== 'confirm') return; records = []; if (saveRecords()) { latest.hidden = true; latest.replaceChildren(); form.reset(); refresh(); switchView('submit'); } });
   refresh();
